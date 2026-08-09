@@ -288,6 +288,41 @@ def test_compression_wait_preserves_sqlite_retry_budget(
     )
 
 
+def test_compression_wait_rearms_no_more_rows_retry_budget(
+    db: SessionDB, monkeypatch
+) -> None:
+    """The sibling InterfaceError contention path gets the same fresh budget."""
+    monkeypatch.setattr(SessionDB, "_TRANSCRIPT_WRITE_PATIENCE_S", 0.1)
+    monkeypatch.setattr(SessionDB, "_COMPRESSION_BUSY_WAIT_MAX_S", 1.0)
+    monkeypatch.setattr(SessionDB, "_WRITE_RETRY_MIN_S", 0.001)
+    monkeypatch.setattr(SessionDB, "_WRITE_RETRY_MAX_S", 0.005)
+    assert db.try_acquire_compression_lock(
+        "sess1", "compressor", ttl_seconds=0.25
+    ) is True
+
+    original_insert = db._insert_message_rows
+    insert_calls = 0
+
+    def _transient_insert(conn, session_id, messages):
+        nonlocal insert_calls
+        insert_calls += 1
+        if insert_calls == 1:
+            raise sqlite3.InterfaceError("no more rows available")
+        return original_insert(conn, session_id, messages)
+
+    monkeypatch.setattr(db, "_insert_message_rows", _transient_insert)
+
+    inserted = db.append_messages_batch(
+        "sess1", [{"role": "user", "content": "landed after InterfaceError"}]
+    )
+
+    assert inserted == 1
+    assert insert_calls == 2
+    assert [row["content"] for row in db.get_messages("sess1")] == [
+        "landed after InterfaceError"
+    ]
+
+
 def test_append_follows_same_holder_lease_refresh(
     db: SessionDB, monkeypatch
 ) -> None:

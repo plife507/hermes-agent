@@ -3132,6 +3132,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _is_no_more_rows(exc: sqlite3.Error) -> bool:
             return "no more rows available" in str(exc).lower()
 
+        def _sqlite_retry_deadline() -> float:
+            """Return the ordinary contention deadline, re-armed once if needed."""
+            nonlocal deadline, sqlite_deadline_needs_rearm
+            if sqlite_deadline_needs_rearm:
+                deadline = time.monotonic() + patience_s
+                sqlite_deadline_needs_rearm = False
+            return deadline
+
         while True:
             try:
                 with self._lock:
@@ -3216,10 +3224,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
-                    if sqlite_deadline_needs_rearm:
-                        deadline = time.monotonic() + patience_s
-                        sqlite_deadline_needs_rearm = False
-                    if self._sleep_before_write_retry(deadline, patience_s):
+                    if self._sleep_before_write_retry(
+                        _sqlite_retry_deadline(), patience_s
+                    ):
                         continue
                     # Patience exhausted — say what actually happened so the
                     # surfaced error doesn't read as disk/permission damage.
@@ -3230,12 +3237,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "a large WAL checkpoint, or an older pre-update "
                         "process; the database itself is healthy)"
                     ) from exc
-                if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                if _is_no_more_rows(exc) and self._sleep_before_write_retry(
+                    _sqlite_retry_deadline(), patience_s
+                ):
                     continue
                 # Non-lock error or patience exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
-                if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                if _is_no_more_rows(exc) and self._sleep_before_write_retry(
+                    _sqlite_retry_deadline(), patience_s
+                ):
                     continue
                 # Corrupt FTS shadow tables make every write raise the
                 # malformed/corrupt error class through the FTS sync triggers
@@ -3255,7 +3266,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # subclass) or another sqlite3.Error class outside the two
                 # handlers above. Message-scoped: anything else propagates
                 # untouched.
-                if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                if _is_no_more_rows(exc) and self._sleep_before_write_retry(
+                    _sqlite_retry_deadline(), patience_s
+                ):
                     continue
                 raise
 
