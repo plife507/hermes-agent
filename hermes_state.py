@@ -2025,6 +2025,18 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
     handler working unchanged.
     """
 
+    def __init__(
+        self,
+        *args,
+        session_id: Optional[str] = None,
+        holder: Optional[str] = None,
+        expires_at: Optional[float] = None,
+    ) -> None:
+        self.session_id = session_id
+        self.holder = holder
+        self.expires_at = expires_at
+        super().__init__(*args)
+
 
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
     """``sqlite3.connect`` that registers the open fd for lock-safety.
@@ -2436,15 +2448,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # wait out the full routine patience under contention. Sub-second budget;
     # a skipped write is retried naturally at the next heartbeat window.
     _ACTIVITY_WRITE_PATIENCE_S = 0.5
-    # A live compression lock gets its own, much shorter budget than the write
-    # lock. Compression publishes in a couple of seconds, so a brief wait saves
-    # the overwhelming majority of concurrent turns (#75083). It deliberately
-    # stays short: the lease is a correctness boundary, not just a busy signal
-    # (see test_compression_lease_blocks_non_owner_but_allows_owner_flush), so
-    # a writer that is still locked out after this budget must still be
-    # refused rather than allowed to land a stale turn in a session whose
-    # compression is genuinely long-running or wedged.
+    # A live compression lock carries the correctness boundary writers need:
+    # its durable ``expires_at`` lease. Wait against that lease instead of the
+    # old fixed five-second assumption — healthy LLM-streamed compressions can
+    # run for minutes (#77386). The fixed budget remains only as a compatibility
+    # fallback for an exception produced without lease metadata.
     _COMPRESSION_BUSY_WAIT_S = 5.0
+    # A live holder can refresh its lease while compression is making progress.
+    # Follow same-holder refreshes, but never wait forever for a wedged worker.
+    # This matches the default compression total ceiling.
+    _COMPRESSION_BUSY_WAIT_MAX_S = 600.0
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
@@ -3100,9 +3113,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
-        # Set on the first compression-busy collision so the short wait is
-        # measured from then, not from the start of the write.
+        # Set on the first compression-busy collision. A live holder may refresh
+        # its lease, but the total wait stays bounded from this first collision.
+        compression_wait_started: Optional[float] = None
+        compression_max_deadline: Optional[float] = None
         compression_deadline: Optional[float] = None
+        compression_holder: Optional[str] = None
+        compression_error: Optional[SessionCompressionInProgressError] = None
 
         # Transient engine-level error observed on contended WAL appends
         # (dual gateway/agent writers; FTS5 trigram sync holds the write
@@ -3119,6 +3136,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
+                        if compression_error is not None:
+                            self._check_observed_compression_lock_resolved(
+                                self._conn, compression_error
+                            )
                         result = fn(self._conn)
                         self._conn.commit()
                     except BaseException:
@@ -3134,24 +3155,51 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
                     self._try_incremental_merge_fts()
                 return result
-            except SessionCompressionInProgressError:
-                # A live foreign compression lock is transient: the compressor
-                # publishes in a couple of seconds. Without any wait, a steer
-                # that lands mid-compression aborts the user's turn as
-                # session_persistence_failed and sends the operator hunting
-                # disk space that was never the problem (#75083).
-                #
-                # The budget is _COMPRESSION_BUSY_WAIT_S, not the write-lock
-                # patience: the lease is a correctness boundary, so a writer
-                # still locked out after a short wait must be refused rather
-                # than left to land a stale turn once a long-running or wedged
-                # compression finally lets go.
-                if compression_deadline is None:
-                    compression_deadline = min(
-                        time.monotonic() + self._COMPRESSION_BUSY_WAIT_S, deadline
+            except SessionCompressionInProgressError as exc:
+                # A live foreign compression lock is transient, but real
+                # LLM-streamed compression takes minutes rather than the five
+                # seconds the original retry assumed (#77386). The lock row's
+                # expires_at is the authoritative correctness boundary. Follow
+                # same-holder lease refreshes up to a bounded total wait; never
+                # cross to a different owner or append after the lease expires.
+                now_monotonic = time.monotonic()
+                if compression_wait_started is None:
+                    compression_wait_started = now_monotonic
+                    compression_max_deadline = (
+                        now_monotonic + self._COMPRESSION_BUSY_WAIT_MAX_S
                     )
+                    compression_holder = exc.holder
+                elif exc.holder != compression_holder:
+                    raise
+
+                compression_error = exc
+                if exc.expires_at is not None:
+                    lease_remaining = max(0.0, exc.expires_at - time.time())
+                    if lease_remaining <= 0.0:
+                        # The row still exists but its lease is expired. Its
+                        # holder may revive it, so this append cannot safely
+                        # proceed or fall back to a fresh fixed wait.
+                        raise
+                    candidate_deadline = now_monotonic + lease_remaining
+                else:
+                    candidate_deadline = (
+                        now_monotonic + self._COMPRESSION_BUSY_WAIT_S
+                    )
+                assert compression_max_deadline is not None
+                candidate_deadline = min(
+                    candidate_deadline, compression_max_deadline
+                )
+                # Follow both extensions and contractions. Keeping a cached
+                # later deadline after the holder shortens its lease would let
+                # this writer append after the durable row expires, while the
+                # holder can still revive and publish a stale snapshot.
+                compression_deadline = candidate_deadline
+                compression_patience = max(
+                    compression_deadline - compression_wait_started,
+                    0.001,
+                )
                 if self._sleep_before_write_retry(
-                    compression_deadline, self._COMPRESSION_BUSY_WAIT_S
+                    compression_deadline, compression_patience
                 ):
                     continue
                 raise
@@ -6969,7 +7017,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         patience note below).
         """
         active_lock = conn.execute(
-            "SELECT holder FROM compression_locks "
+            "SELECT holder, expires_at FROM compression_locks "
             "WHERE session_id = ? AND expires_at > ?",
             (session_id, time.time()),
         ).fetchone()
@@ -6978,7 +7026,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             and active_lock["holder"] != compression_lock_holder
         ):
             raise SessionCompressionInProgressError(
-                f"Session {session_id!r} is being compressed by another writer"
+                f"Session {session_id!r} is being compressed by another writer",
+                session_id=session_id,
+                holder=active_lock["holder"],
+                expires_at=float(active_lock["expires_at"]),
             )
         session = conn.execute(
             "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
@@ -6990,6 +7041,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             and session["end_reason"] == "compression"
         ):
             raise CompressionSessionClosedError(session_id)
+
+    @staticmethod
+    def _check_observed_compression_lock_resolved(
+        conn,
+        observed: SessionCompressionInProgressError,
+    ) -> None:
+        """Fence a waited append against an expired-but-revivable lease row.
+
+        This runs inside the same ``BEGIN IMMEDIATE`` transaction as the
+        eventual append. A deleted row means the compressor explicitly
+        released its lease and the write may proceed. Any row that remains —
+        even an expired one — still belongs to a holder that can refresh and
+        publish its old snapshot, so the append must remain blocked.
+        """
+        if observed.session_id is None:
+            return
+        row = conn.execute(
+            "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
+            (observed.session_id,),
+        ).fetchone()
+        if row is None:
+            return
+        raise SessionCompressionInProgressError(
+            f"Session {observed.session_id!r} is being compressed by another writer",
+            session_id=observed.session_id,
+            holder=row["holder"],
+            expires_at=float(row["expires_at"]),
+        )
 
     @staticmethod
     def _decode_display_metadata(raw: Any) -> Optional[Dict[str, Any]]:
