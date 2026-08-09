@@ -282,7 +282,9 @@ def test_publish_compression_child_rejects_lost_or_expired_lease(db: SessionDB) 
 
 def test_compression_lease_blocks_non_owner_but_allows_owner_flush(
     db: SessionDB,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setattr(SessionDB, "_COMPRESSION_BUSY_WAIT_MAX_S", 0.0)
     db.create_session("leased", source="webui")
     assert db.try_acquire_compression_lock("leased", "winner", ttl_seconds=60)
 

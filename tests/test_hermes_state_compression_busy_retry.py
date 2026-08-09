@@ -127,10 +127,10 @@ def test_append_waits_past_fixed_budget_until_live_lease_clears(
     )
 
 
-def test_append_refuses_to_cross_expired_lease_boundary(
+def test_append_atomically_invalidates_expired_lease(
     db: SessionDB, monkeypatch
 ) -> None:
-    """A stale compressor snapshot must not admit a post-expiry append."""
+    """Expiry and append are serialized so the old holder cannot revive."""
     monkeypatch.setattr(SessionDB, "_COMPRESSION_BUSY_WAIT_S", 0.1)
     monkeypatch.setattr(
         SessionDB, "_COMPRESSION_BUSY_WAIT_MAX_S", 2.0, raising=False
@@ -140,14 +140,47 @@ def test_append_refuses_to_cross_expired_lease_boundary(
     ) is True
 
     started = time.monotonic()
-    with pytest.raises(CompressionSessionBusyError):
-        db.append_message("sess1", role="user", content="must never land")
+    db.append_message("sess1", role="user", content="landed after invalidation")
     elapsed = time.monotonic() - started
 
     assert elapsed >= 0.3, "gave up before the live lease boundary"
     assert elapsed < 2.0, "wait crossed its bounded lease deadline"
-    assert all(
-        row["content"] != "must never land" for row in db.get_messages("sess1")
+    assert db.refresh_compression_lock("sess1", "compressor") is False
+    assert any(
+        row["content"] == "landed after invalidation"
+        for row in db.get_messages("sess1")
+    )
+
+
+def test_fresh_retry_invalidates_expired_row_before_appending(
+    db: SessionDB, monkeypatch
+) -> None:
+    """A later gateway retry must not bypass a revivable expired row."""
+    monkeypatch.setattr(
+        SessionDB, "_COMPRESSION_BUSY_WAIT_MAX_S", 0.1, raising=False
+    )
+    assert db.try_acquire_compression_lock(
+        "sess1", "compressor", ttl_seconds=0.4
+    ) is True
+
+    with pytest.raises(CompressionSessionBusyError):
+        db.append_message("sess1", role="user", content="first attempt")
+
+    time.sleep(0.35)
+    db.append_message("sess1", role="user", content="fresh retry")
+
+    assert db.refresh_compression_lock("sess1", "compressor") is False
+    with pytest.raises(CompressionSessionBusyError):
+        db.publish_compression_child(
+            parent_session_id="sess1",
+            child_session_id="stale-child",
+            source="test",
+            messages=[{"role": "assistant", "content": "stale snapshot"}],
+            compression_lock_holder="compressor",
+        )
+    assert db.get_session("stale-child") is None
+    assert any(
+        row["content"] == "fresh retry" for row in db.get_messages("sess1")
     )
 
 
@@ -216,16 +249,17 @@ def test_append_follows_same_holder_lease_contraction(
     t.start()
     try:
         started = time.monotonic()
-        with pytest.raises(CompressionSessionBusyError):
-            db.append_message("sess1", role="user", content="must never land")
+        db.append_message("sess1", role="user", content="followed contraction")
         elapsed = time.monotonic() - started
     finally:
         t.join(timeout=5)
 
     assert shortened.is_set(), "test bug: lease was never shortened"
     assert elapsed < 0.8, "writer retained the original, later lease deadline"
-    assert all(
-        row["content"] != "must never land" for row in db.get_messages("sess1")
+    assert db.refresh_compression_lock("sess1", "compressor") is False
+    assert any(
+        row["content"] == "followed contraction"
+        for row in db.get_messages("sess1")
     )
 
 

@@ -3137,8 +3137,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
                         if compression_error is not None:
-                            self._check_observed_compression_lock_resolved(
-                                self._conn, compression_error
+                            self._check_or_reclaim_foreign_compression_lock(
+                                self._conn,
+                                compression_error.session_id,
+                                compression_lock_holder=None,
                             )
                         result = fn(self._conn)
                         self._conn.commit()
@@ -3161,7 +3163,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # seconds the original retry assumed (#77386). The lock row's
                 # expires_at is the authoritative correctness boundary. Follow
                 # same-holder lease refreshes up to a bounded total wait; never
-                # cross to a different owner or append after the lease expires.
+                # cross to a different owner. At expiry, the retry transaction
+                # atomically deletes the stale row before admitting the append,
+                # so the old holder cannot revive and publish its old snapshot.
                 now_monotonic = time.monotonic()
                 if compression_wait_started is None:
                     compression_wait_started = now_monotonic
@@ -3176,10 +3180,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if exc.expires_at is not None:
                     lease_remaining = max(0.0, exc.expires_at - time.time())
                     if lease_remaining <= 0.0:
-                        # The row still exists but its lease is expired. Its
-                        # holder may revive it, so this append cannot safely
-                        # proceed or fall back to a fresh fixed wait.
-                        raise
+                        # Re-enter the write transaction once so the expiry is
+                        # resolved atomically: either refresh already won and
+                        # the live lease blocks, or this writer deletes the
+                        # expired row before appending.
+                        continue
                     candidate_deadline = now_monotonic + lease_remaining
                 else:
                     candidate_deadline = (
@@ -7016,21 +7021,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (this guard has already needed targeted fixes — see the #74478
         patience note below).
         """
-        active_lock = conn.execute(
-            "SELECT holder, expires_at FROM compression_locks "
-            "WHERE session_id = ? AND expires_at > ?",
-            (session_id, time.time()),
-        ).fetchone()
-        if (
-            active_lock is not None
-            and active_lock["holder"] != compression_lock_holder
-        ):
-            raise SessionCompressionInProgressError(
-                f"Session {session_id!r} is being compressed by another writer",
-                session_id=session_id,
-                holder=active_lock["holder"],
-                expires_at=float(active_lock["expires_at"]),
-            )
+        self._check_or_reclaim_foreign_compression_lock(
+            conn,
+            session_id,
+            compression_lock_holder=compression_lock_holder,
+        )
         session = conn.execute(
             "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
             (session_id,),
@@ -7043,31 +7038,42 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise CompressionSessionClosedError(session_id)
 
     @staticmethod
-    def _check_observed_compression_lock_resolved(
+    def _check_or_reclaim_foreign_compression_lock(
         conn,
-        observed: SessionCompressionInProgressError,
+        session_id: Optional[str],
+        compression_lock_holder: Optional[str],
     ) -> None:
-        """Fence a waited append against an expired-but-revivable lease row.
+        """Block a live foreign lease or atomically invalidate an expired one.
 
-        This runs inside the same ``BEGIN IMMEDIATE`` transaction as the
-        eventual append. A deleted row means the compressor explicitly
-        released its lease and the write may proceed. Any row that remains —
-        even an expired one — still belongs to a holder that can refresh and
-        publish its old snapshot, so the append must remain blocked.
+        This runs inside the same ``BEGIN IMMEDIATE`` transaction as the append.
+        When the foreign lease is expired, deleting its row and appending are
+        one serialized operation: the old holder's later refresh matches no
+        row, and publication fails closed. If refresh wins first, this query
+        sees the extended live lease and blocks instead.
         """
-        if observed.session_id is None:
+        if session_id is None:
             return
         row = conn.execute(
             "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
-            (observed.session_id,),
+            (session_id,),
         ).fetchone()
-        if row is None:
+        if row is None or row["holder"] == compression_lock_holder:
             return
+        expires_at = float(row["expires_at"])
+        now = time.time()
+        if expires_at <= now:
+            deleted = conn.execute(
+                "DELETE FROM compression_locks "
+                "WHERE session_id = ? AND holder = ? AND expires_at <= ?",
+                (session_id, row["holder"], now),
+            )
+            if deleted.rowcount == 1:
+                return
         raise SessionCompressionInProgressError(
-            f"Session {observed.session_id!r} is being compressed by another writer",
-            session_id=observed.session_id,
+            f"Session {session_id!r} is being compressed by another writer",
+            session_id=session_id,
             holder=row["holder"],
-            expires_at=float(row["expires_at"]),
+            expires_at=expires_at,
         )
 
     @staticmethod
