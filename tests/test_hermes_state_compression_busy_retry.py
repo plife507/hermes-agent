@@ -15,6 +15,7 @@ and must still fail fast rather than spin out the whole budget.
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -191,6 +192,99 @@ def test_fresh_retry_invalidates_expired_row_before_appending(
     )
     assert any(
         row["content"] == "fresh retry" for row in db.get_messages("sess1")
+    )
+
+
+def test_expired_owner_flushes_before_refresh_and_publication(db: SessionDB) -> None:
+    """Owner-first keeps the row, so its exact current turn is not omitted."""
+    assert db.try_acquire_compression_lock(
+        "sess1", "compressor", ttl_seconds=0.1
+    ) is True
+    time.sleep(0.12)
+
+    db.append_message(
+        "sess1",
+        role="assistant",
+        content="current turn",
+        compression_lock_holder="compressor",
+    )
+    assert db.refresh_compression_lock(
+        "sess1", "compressor", ttl_seconds=1.0
+    ) is True
+    db.publish_compression_child(
+        parent_session_id="sess1",
+        child_session_id="child1",
+        source="test",
+        messages=[{"role": "assistant", "content": "summary"}],
+        compression_lock_holder="compressor",
+    )
+
+    parent = db.get_session("sess1")
+    assert parent is not None
+    assert parent["end_reason"] == "compression"
+    assert [row["content"] for row in db.get_messages("sess1")] == [
+        "current turn"
+    ]
+    assert [row["content"] for row in db.get_messages("child1")] == ["summary"]
+
+
+def test_compression_wait_preserves_sqlite_retry_budget(
+    db: SessionDB, monkeypatch
+) -> None:
+    """Post-lease SQLite contention receives a fresh ordinary retry budget."""
+    monkeypatch.setattr(SessionDB, "_TRANSCRIPT_WRITE_PATIENCE_S", 0.2)
+    monkeypatch.setattr(SessionDB, "_COMPRESSION_BUSY_WAIT_MAX_S", 2.0)
+    assert db._conn is not None
+    db._conn.execute("PRAGMA busy_timeout=100")
+    assert db.try_acquire_compression_lock(
+        "sess1", "compressor", ttl_seconds=0.3
+    ) is True
+
+    compression_observed = threading.Event()
+    holder_ready = threading.Event()
+    holder_errors: list[BaseException] = []
+    original_sleep = db._sleep_before_write_retry
+    first_retry = True
+
+    def _sleep_after_holder_starts(deadline: float, patience_s: float) -> bool:
+        nonlocal first_retry
+        if first_retry:
+            first_retry = False
+            compression_observed.set()
+            assert holder_ready.wait(timeout=2), "test bug: SQLite holder never started"
+        return original_sleep(deadline, patience_s)
+
+    monkeypatch.setattr(db, "_sleep_before_write_retry", _sleep_after_holder_starts)
+
+    def _hold_write_transaction() -> None:
+        conn = sqlite3.connect(db.db_path, isolation_level=None, timeout=2.0)
+        try:
+            assert compression_observed.wait(timeout=2)
+            conn.execute("BEGIN IMMEDIATE")
+            # Consume the original transcript patience before allowing the
+            # writer to proceed into SQLite contention.
+            time.sleep(0.25)
+            holder_ready.set()
+            time.sleep(0.3)
+            conn.commit()
+        except BaseException as exc:
+            holder_errors.append(exc)
+            holder_ready.set()
+        finally:
+            conn.close()
+
+    holder = threading.Thread(target=_hold_write_transaction, daemon=True)
+    holder.start()
+    try:
+        db.append_message("sess1", role="user", content="landed after both waits")
+    finally:
+        holder.join(timeout=3)
+
+    assert not holder.is_alive(), "test bug: SQLite holder did not finish"
+    assert holder_errors == []
+    assert any(
+        row["content"] == "landed after both waits"
+        for row in db.get_messages("sess1")
     )
 
 

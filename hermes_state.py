@@ -3120,6 +3120,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compression_deadline: Optional[float] = None
         compression_holder: Optional[str] = None
         compression_error: Optional[SessionCompressionInProgressError] = None
+        sqlite_deadline_needs_rearm = False
 
         # Transient engine-level error observed on contended WAL appends
         # (dual gateway/agent writers; FTS5 trigram sync holds the write
@@ -3177,6 +3178,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     raise
 
                 compression_error = exc
+                # Compression has an independent lease-aware wait budget. Do
+                # not let that wait consume the ordinary SQLite contention
+                # budget needed once the lease boundary is reached.
+                sqlite_deadline_needs_rearm = True
                 if exc.expires_at is not None:
                     lease_remaining = max(0.0, exc.expires_at - time.time())
                     if lease_remaining <= 0.0:
@@ -3211,6 +3216,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
+                    if sqlite_deadline_needs_rearm:
+                        deadline = time.monotonic() + patience_s
+                        sqlite_deadline_needs_rearm = False
                     if self._sleep_before_write_retry(deadline, patience_s):
                         continue
                     # Patience exhausted — say what actually happened so the
@@ -7050,8 +7058,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         one serialized operation: the old holder's later refresh matches no
         row, and publication fails closed. If refresh wins first, this query
         sees the extended live lease and blocks instead. Holder-qualified
-        compressor writes additionally require their own live row; a stale
-        owner cannot flush into the parent after another writer invalidates it.
+        compressor writes require their own row, but may flush while that row
+        is expired: owner-first flush remains serialized before a later refresh
+        and publication, while writer-first invalidation removes the row and
+        makes the stale owner fail closed.
         """
         if session_id is None:
             return
@@ -7064,7 +7074,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if (
                 row is None
                 or row["holder"] != compression_lock_holder
-                or float(row["expires_at"]) <= now
             ):
                 raise CompressionSessionBusyError(
                     f"Compression lease lost before transcript append: {session_id}"
