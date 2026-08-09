@@ -7049,7 +7049,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         When the foreign lease is expired, deleting its row and appending are
         one serialized operation: the old holder's later refresh matches no
         row, and publication fails closed. If refresh wins first, this query
-        sees the extended live lease and blocks instead.
+        sees the extended live lease and blocks instead. Holder-qualified
+        compressor writes additionally require their own live row; a stale
+        owner cannot flush into the parent after another writer invalidates it.
         """
         if session_id is None:
             return
@@ -7057,10 +7059,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
             (session_id,),
         ).fetchone()
-        if row is None or row["holder"] == compression_lock_holder:
+        now = time.time()
+        if compression_lock_holder is not None:
+            if (
+                row is None
+                or row["holder"] != compression_lock_holder
+                or float(row["expires_at"]) <= now
+            ):
+                raise CompressionSessionBusyError(
+                    f"Compression lease lost before transcript append: {session_id}"
+                )
+            return
+        if row is None:
             return
         expires_at = float(row["expires_at"])
-        now = time.time()
         if expires_at <= now:
             deleted = conn.execute(
                 "DELETE FROM compression_locks "

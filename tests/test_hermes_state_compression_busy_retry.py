@@ -170,6 +170,13 @@ def test_fresh_retry_invalidates_expired_row_before_appending(
     db.append_message("sess1", role="user", content="fresh retry")
 
     assert db.refresh_compression_lock("sess1", "compressor") is False
+    with pytest.raises(CompressionSessionBusyError, match="lease lost"):
+        db.append_message(
+            "sess1",
+            role="assistant",
+            content="stale owner flush",
+            compression_lock_holder="compressor",
+        )
     with pytest.raises(CompressionSessionBusyError):
         db.publish_compression_child(
             parent_session_id="sess1",
@@ -179,6 +186,9 @@ def test_fresh_retry_invalidates_expired_row_before_appending(
             compression_lock_holder="compressor",
         )
     assert db.get_session("stale-child") is None
+    assert all(
+        row["content"] != "stale owner flush" for row in db.get_messages("sess1")
+    )
     assert any(
         row["content"] == "fresh retry" for row in db.get_messages("sess1")
     )
