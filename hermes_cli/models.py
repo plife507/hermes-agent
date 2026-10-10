@@ -1219,8 +1219,7 @@ def provider_label(provider: Optional[str]) -> str:
 
 
 def _is_openai_fast_model(model_id: Optional[str]) -> bool:
-    """OpenAI flagship eligible for Priority Processing. Codex-series excluded — the Codex Responses
-    API doesn't accept ``service_tier``."""
+    """OpenAI flagship eligible for Priority Processing; Codex-series models are excluded."""
     base = _strip_vendor_prefix(str(model_id or "")).split(":")[0]
     return bool(base) and "codex" not in base and base.startswith(tuple(_OPENAI_FAST_MODE_PREFIXES))
 
@@ -1250,7 +1249,7 @@ def _is_anthropic_fast_model(model_id: Optional[str]) -> bool:
 
 
 def _fast_mode_route_supported(
-    model_id: Optional[str], provider: Optional[str], base_url: Optional[str]) -> bool:
+    model_id: Optional[str], provider: Optional[str], base_url: Optional[str], tier: Optional[str] = None) -> bool:
     """Only the first-party endpoint that bills for fast mode may receive its params."""
     from urllib.parse import urlparse
 
@@ -1261,15 +1260,17 @@ def _fast_mode_route_supported(
     elif is_grok_46_family(str(model_id or "")):
         allowed = {"xai": "api.x.ai"}
     else:
-        allowed = {
+        allowed = {"openai-codex": "chatgpt.com"} if tier == "ultrafast" else {
             "openai": "api.openai.com",
             "openai-api": "api.openai.com",
             "openai-codex": "chatgpt.com",
         }
+    if tier == "ultrafast" and not provider:
+        return False
     if provider and normalize_provider(provider) not in allowed:
         return False
     host = (urlparse(str(base_url or "")).hostname or "").lower()
-    return not host or host in allowed.values()
+    return (not base_url if tier == "ultrafast" else not host) or host in allowed.values()
 
 
 def model_supports_ultrafast(model_id: Optional[str]) -> bool:
@@ -1284,15 +1285,13 @@ def resolve_fast_mode_overrides(
     model_id: Optional[str], *, provider: Optional[str] = None, base_url: Optional[str] = None,
     tier: Optional[str] = None,
 ) -> dict[str, Any] | None:
-    """Fast/priority request_overrides — ``{"speed": "fast"}`` (Anthropic Fast Mode) or
-    ``{"service_tier": "priority"}`` (OpenAI / xAI Priority Processing) — or None if unsupported.
-    ``tier="ultrafast"`` asks for OpenAI Ultrafast instead: ``{"service_tier": "ultrafast"}`` on an
-    Ultrafast model, None elsewhere (never a silent downgrade to a different paid tier).
-    With ``provider``/``base_url`` the route is gated too (``_fast_mode_route_supported``) so proxies
-    never see the params. Single fast-mode gate for ``/fast`` and ``agent.fast_mode`` windows."""
+    """Route-aware Fast override: Anthropic ``speed: fast`` or OpenAI/xAI ``service_tier: priority``.
+    Ultrafast requires an eligible model on ``openai-codex`` (subscription), never direct API/proxy.
+    Unknown Ultrafast routes fail closed; unsupported tiers return None, never a paid downgrade.
+    Shared by command surfaces, the picker and per-request ``agent.fast_mode`` filtering."""
     if not model_supports_fast_mode(model_id):
         return None
-    if (provider or base_url) and not _fast_mode_route_supported(model_id, provider, base_url):
+    if (provider or base_url or tier == "ultrafast") and not _fast_mode_route_supported(model_id, provider, base_url, tier):
         return None
     if tier == "ultrafast":
         return {"service_tier": "ultrafast"} if model_supports_ultrafast(model_id) else None

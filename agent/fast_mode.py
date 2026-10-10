@@ -21,7 +21,7 @@ DEFAULT_WINDOW_SECONDS = 60
 # capacity for the model (https://platform.claude.com/docs/en/build-with-claude/fast-mode).
 _FAST_LIMIT_HEADERS = ("anthropic-fast-input-tokens-limit", "anthropic-fast-output-tokens-limit")
 #: Tiers sent on every request of the session (OpenAI ``service_tier`` values; ``priority`` also
-#: selects Anthropic/xAI fast mode). Ultrafast is OpenAI-only and gated per model.
+#: selects Anthropic/xAI fast mode). Ultrafast is Codex-subscription-only and gated per model.
 STATIC_TIERS = frozenset({"priority", "ultrafast"})
 # Codex app-server names for wire tiers it accepts (turn/start.serviceTier); a tier missing here is not sent.
 CODEX_TIER_WORDS: dict[str, str] = {"priority": "fast"}
@@ -76,6 +76,19 @@ def effective_request_overrides(agent: Any) -> dict[str, Any]:
     """``agent.request_overrides`` plus the fast override while the window is open, minus
     ``speed`` for a model this session learned has no fast capacity."""
     overrides = dict(getattr(agent, "request_overrides", None) or {})
+    # Saved/manual overrides can outlive a model/provider switch. Recheck at the request boundary,
+    # without downgrading Ultrafast to Priority or changing unrelated request/reasoning parameters.
+    extra_body = overrides.get("extra_body")
+    body_ultrafast = isinstance(extra_body, dict) and extra_body.get("service_tier") == "ultrafast"
+    if overrides.get("service_tier") == "ultrafast" or body_ultrafast:
+        from hermes_cli.models import resolve_fast_mode_overrides
+
+        if resolve_fast_mode_overrides(getattr(agent, "model", None), provider=getattr(agent, "provider", None),
+                                       base_url=getattr(agent, "base_url", None), tier="ultrafast") is None:
+            if overrides.get("service_tier") == "ultrafast":
+                overrides.pop("service_tier")
+            if body_ultrafast:
+                overrides["extra_body"] = {k: v for k, v in extra_body.items() if k != "service_tier"}
     if getattr(agent, "service_tier", None) in BOUNDED_MODES and time.monotonic() < getattr(agent, "_fast_until", 0.0):
         from hermes_cli.models import resolve_fast_mode_overrides
         base_url = getattr(agent, "base_url", None)

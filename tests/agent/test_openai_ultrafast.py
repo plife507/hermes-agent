@@ -34,10 +34,9 @@ def test_every_config_loader_parses_tiers_through_the_same_table(monkeypatch):
     assert "ultrafast" in STATIC_TIERS
 
 
-@pytest.mark.parametrize("provider,base_url", [("openai", "https://api.openai.com/v1"),
-                                               ("openai-api", "https://api.openai.com/v1"),
-                                               ("openai-codex", "https://chatgpt.com/backend-api/codex")])
-def test_ultrafast_is_requested_only_for_ultrafast_models_on_first_party_routes(provider, base_url):
+@pytest.mark.parametrize("base_url", [None, "https://chatgpt.com/backend-api/codex"])
+def test_ultrafast_is_requested_only_for_ultrafast_models_on_codex_subscription(base_url):
+    provider = "openai-codex"
     for model in (*ASTRA_SPELLINGS, *SOL_SPELLINGS):
         assert model_supports_ultrafast(model), model
         assert resolve_fast_mode_overrides(model, provider=provider, base_url=base_url, tier="ultrafast") == {
@@ -77,27 +76,32 @@ def test_desktop_surfaces_carry_the_exact_tier_ultrafast_is_never_plain_fast():
         create_overrides({"service_tier": "turbo"})
 
 
-@pytest.mark.parametrize("provider", ["openai", "openai-api"])
-def test_cli_and_gateway_turn_routes_send_the_static_tier(provider):
+@pytest.mark.parametrize("provider,base_url,expected", [
+    ("openai", "https://api.openai.com/v1", None),
+    ("openai-api", "https://api.openai.com/v1", None),
+    ("openai-codex", "https://chatgpt.com/backend-api/codex", {"service_tier": "ultrafast"}),
+])
+def test_cli_and_gateway_turn_routes_gate_the_static_tier(provider, base_url, expected):
     import cli as cli_mod
     from gateway.run import GatewayRunner
 
-    stub = SimpleNamespace(model="gpt-6-astra", api_key="k", base_url="https://api.openai.com/v1", provider=provider,
+    stub = SimpleNamespace(model="gpt-6-astra", api_key="k", base_url=base_url, provider=provider,
                            api_mode="codex_responses", acp_command=None, acp_args=[], _credential_pool=None,
                            service_tier="ultrafast")
-    assert cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")["request_overrides"] == {"service_tier": "ultrafast"}
+    assert cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")["request_overrides"] == expected
     runner = object.__new__(GatewayRunner)
     runner._service_tier = "ultrafast"
-    rk = {"api_key": "k", "base_url": "https://api.openai.com/v1", "provider": provider, "api_mode": "codex_responses",
+    rk = {"api_key": "k", "base_url": base_url, "provider": provider, "api_mode": "codex_responses",
           "command": None, "args": [], "credential_pool": None, "max_tokens": None}
-    assert runner._resolve_turn_agent_config("hi", "gpt-6-astra", rk)["request_overrides"] == {"service_tier": "ultrafast"}
+    assert runner._resolve_turn_agent_config("hi", "gpt-6-astra", rk)["request_overrides"] == (expected or {})
 
 
 def test_cli_refuses_ultrafast_on_a_model_without_it(monkeypatch):
     import cli as cli_mod
     from unittest.mock import MagicMock
 
-    stub = SimpleNamespace(service_tier="priority", model="gpt-6-sol", agent=MagicMock(model="gpt-6-sol"),
+    stub = SimpleNamespace(service_tier="priority", model="gpt-6-sol", provider="openai-codex",
+                           base_url="https://chatgpt.com/backend-api/codex", agent=MagicMock(model="gpt-6-sol"),
                            _fast_command_available=lambda: True)
     monkeypatch.setattr(cli_mod, "_cprint", lambda *a, **k: None)
     cli_mod.HermesCLI._handle_fast_command(stub, "/fast ultrafast")
@@ -159,7 +163,8 @@ def test_sol_ultrafast_codex_request_uses_the_wire_slug_and_keeps_subscription_a
     base_url = "https://chatgpt.com/backend-api/codex"
     runtime_model = normalize_model_for_provider(model, "openai-codex")
     overrides = resolve_fast_mode_overrides(runtime_model, provider="openai-codex", base_url=base_url, tier="ultrafast")
-    agent = SimpleNamespace(service_tier="ultrafast", request_overrides=overrides)
+    agent = SimpleNamespace(service_tier="ultrafast", request_overrides=overrides, model=runtime_model,
+                            provider="openai-codex", base_url=base_url, api_mode="codex_responses")
     transport = ResponsesApiTransport()
     kwargs = transport.build_kwargs(
         runtime_model, [{"role": "user", "content": "hi"}], provider="openai-codex", base_url=base_url,

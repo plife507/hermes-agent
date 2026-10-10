@@ -171,6 +171,25 @@ _FAST_WORDS = {"fast": "fast", "on": "fast", "normal": "normal", "off": "normal"
                "auto": "auto", "cold": "cold", "ultrafast": "ultrafast"}
 
 
+def _fast_target_route(agent, session):
+    """Draft picks precede profile defaults; validation must not build an agent or access credentials."""
+    if agent is not None:
+        return getattr(agent, "model", None), getattr(agent, "provider", None), getattr(agent, "base_url", None)
+    from hermes_cli.models import normalize_provider
+
+    cfg_model = _load_cfg().get("model")
+    cfg_model = cfg_model if isinstance(cfg_model, dict) else {}
+    override = (session or {}).get("model_override") or {}
+    if isinstance(override, str):
+        override = {"model": override}
+    provider = override.get("provider") or cfg_model.get("provider")
+    base_url = override.get("base_url")
+    # A new provider uses its own default endpoint, not the previous profile provider's URL.
+    if not base_url and normalize_provider(provider) == normalize_provider(cfg_model.get("provider")):
+        base_url = cfg_model.get("base_url")
+    return override.get("model") or _resolve_model(), provider, base_url
+
+
 def _set_fast(rid, params, key, value, session):
     raw = _word(value)
     agent = session.get("agent") if session else None
@@ -189,15 +208,11 @@ def _set_fast(rid, params, key, value, session):
     overrides = None
     if nv in ("fast", "ultrafast"):
         from hermes_cli.models import resolve_fast_mode_overrides
-        if agent is not None:
-            target_model = getattr(agent, "model", None)
-        else:  # a pre-build session may carry a picked model (desktop draft): validate against THAT
-            session_override = (session or {}).get("model_override") or {}
-            target_model = (isinstance(session_override, dict) and session_override.get("model")) or _resolve_model()
+        target_model, target_provider, target_base_url = _fast_target_route(agent, session)
         if not target_model:
             return _err(rid, 4002, "fast mode is not available without a selected model")
-        overrides = resolve_fast_mode_overrides(target_model, provider=getattr(agent, "provider", None),
-                                                base_url=getattr(agent, "base_url", None),
+        overrides = resolve_fast_mode_overrides(target_model, provider=target_provider,
+                                                base_url=target_base_url,
                                                 tier="ultrafast" if nv == "ultrafast" else None)
         if overrides is None:
             return _err(rid, 4002, f"{nv} mode is not available for this model")
